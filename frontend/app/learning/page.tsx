@@ -17,7 +17,7 @@ export default async function LearningPage() {
             Learning, with every gate visible.
           </h2>
           <p className="mt-2 max-w-2xl text-sm leading-6 text-zinc-500">
-            Inspect approved-example readiness, local training runs, and adapter qualification without changing system state.
+            Review training plans, monitor local jobs, and manage candidate qualification and routes.
           </p>
         </div>
         <LearningStudio />

@@ -28,13 +28,14 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("model", choices=LOCAL_MODELS)
     parser.add_argument("output", type=Path)
+    parser.add_argument("--pilot", type=Path, default=PILOT)
     parser.add_argument("--smoke", action="store_true", help="Run one unreviewed case as a wiring check")
     args = parser.parse_args()
     os.environ["HF_HUB_OFFLINE"] = "1"
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
-    pilot_bytes = PILOT.read_bytes()
+    pilot_bytes = args.pilot.read_bytes()
     digest = hashlib.sha256(pilot_bytes).hexdigest()
-    if digest != PILOT.with_name("SHA256SUMS").read_text().split()[0]:
+    if digest != args.pilot.with_name("SHA256SUMS").read_text().split()[0]:
         parser.error("pilot checksum mismatch")
     rows = [json.loads(line) for line in pilot_bytes.splitlines()]
     if args.smoke:

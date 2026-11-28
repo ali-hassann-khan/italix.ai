@@ -28,6 +28,7 @@ export interface LearningConfig {
 export interface LearningJobMetrics {
   duration_seconds: number | null;
   optimizer_steps: number | null;
+  current_step: number | null;
   train_examples: number | null;
   validation_examples: number | null;
   peak_mlx_memory_gb: number | null;
@@ -46,6 +47,7 @@ export interface LearningJob {
   candidate_id: string | null;
   created_at: string;
   completed_at: string | null;
+  failure: string | null;
   metrics: LearningJobMetrics;
 }
 

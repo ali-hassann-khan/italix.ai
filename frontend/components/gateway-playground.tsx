@@ -43,6 +43,7 @@ type HybridResult = {
     latency_ms: number;
     summary: string;
     evidence: unknown[];
+    file_coverage?: { covered_paths: string[]; total_files: number; complete: boolean };
     llm_invoked: boolean;
     prompt_tokens: number | null;
     completion_tokens: number | null;
@@ -443,6 +444,7 @@ export function GatewayPlayground({ activeModels }: { activeModels: ActiveModel[
                   {hybridResult.explanation.model && <p>Model · {hybridResult.explanation.model}</p>}
                   <p>Prompt tokens · {hybridResult.explanation.prompt_tokens ?? "Unavailable"} · Output tokens · {hybridResult.explanation.completion_tokens ?? "Unavailable"}</p>
                   <h3>Code excerpts</h3>
+                  {hybridResult.explanation.file_coverage && <p>Evidence covers {hybridResult.explanation.file_coverage.covered_paths.length} of {hybridResult.explanation.file_coverage.total_files} changed files.</p>}
                   <pre className="whitespace-pre-wrap break-words">{JSON.stringify(hybridResult.explanation.evidence, null, 2)}</pre>
                 </>}
               </div>

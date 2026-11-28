@@ -84,6 +84,7 @@ def test_dashboard_playground_feedback_to_queue(monkeypatch):
     next(area for area in app.text_area if area.label == "Developer request or Git diff").set_value(
         "Summarize this PR:\n\ndiff --git a/a.py b/a.py\n+x = 1"
     )
+    app.run()
     next(button for button in app.button if button.label == "Run through ITALIX").click()
     app.run()
     assert not app.exception

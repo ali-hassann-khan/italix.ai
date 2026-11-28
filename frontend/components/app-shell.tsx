@@ -27,7 +27,7 @@ const navigation = [
   { label: "Evaluations", icon: FlaskConical },
   { label: "Model Registry", icon: ServerCog },
   { label: "Usage & Costs", icon: ChartNoAxesCombined },
-  { label: "Developer Memory", icon: MemoryStick },
+  { label: "Developer Memory", icon: MemoryStick, href: "/memory" },
   { label: "Demo", icon: GalleryVerticalEnd },
 ] as const;
 
@@ -140,7 +140,9 @@ export function AppShell({
     ? { title: "AI Gateway", subtitle: "Local inference playground" }
     : pathname === "/learning"
       ? { title: "Learning Studio", subtitle: "Specialist training progress" }
-      : { title: "Overview", subtitle: "Infrastructure health and routing" };
+      : pathname === "/memory"
+        ? { title: "Developer Memory", subtitle: "Local sources and decisions" }
+        : { title: "Overview", subtitle: "Infrastructure health and routing" };
 
   useEffect(() => {
     if (!mobileOpen) return;

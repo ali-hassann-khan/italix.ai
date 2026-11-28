@@ -45,7 +45,7 @@ function nullableText(value: unknown): string | null {
   return typeof value === "string" && value.trim() ? value.slice(0, 500) : null;
 }
 
-async function operatorGet(path: string): Promise<unknown> {
+export async function operatorGet(path: string): Promise<unknown> {
   const token = process.env.ITALIX_OPERATOR_TOKEN;
   if (!token) throw new Error("ITALIX operator credentials are not configured.");
   const response = await fetch(`${backendUrl()}${path}`, {
@@ -126,6 +126,7 @@ function sanitizeJob(value: unknown, models: ReadonlyMap<string, LearningModel>)
   const safeMetrics: LearningJobMetrics = {
     duration_seconds: nullableNumber(metrics.duration_seconds),
     optimizer_steps: nullableNumber(metrics.optimizer_steps),
+    current_step: nullableNumber(metrics.current_step),
     train_examples: nullableNumber(metrics.train_examples),
     validation_examples: nullableNumber(metrics.validation_examples),
     peak_mlx_memory_gb: nullableNumber(metrics.peak_mlx_memory_gb),
@@ -143,6 +144,10 @@ function sanitizeJob(value: unknown, models: ReadonlyMap<string, LearningModel>)
     candidate_id: candidateId,
     created_at: text(job.created_at),
     completed_at: nullableText(job.completed_at),
+    failure: job.status === "failed" ? (
+      job.error === "Local worker interrupted" ? "Worker interrupted. Examples returned to the queue."
+        : "Training failed. Inspect the local job and create a new plan after correcting the issue."
+    ) : null,
     metrics: safeMetrics,
   };
 }
@@ -227,12 +232,16 @@ export async function createOperatorHybridTriage(request: { content: string; exp
 }
 
 async function operatorPost(path: string, request: unknown): Promise<OperatorBackendResponse> {
+  return operatorMutation(path, "POST", request);
+}
+
+export async function operatorMutation(path: string, method: "POST" | "DELETE", request?: unknown): Promise<OperatorBackendResponse> {
   const token = process.env.ITALIX_OPERATOR_TOKEN;
   if (!token) throw new Error("ITALIX operator credentials are not configured.");
 
   const started = performance.now();
   const response = await fetch(`${backendUrl()}${path}`, {
-    method: "POST",
+    method,
     headers: {
       Authorization: `Bearer ${token}`,
       "Content-Type": "application/json",

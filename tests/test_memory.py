@@ -24,7 +24,7 @@ class MemoryEngine:
         assert adapter_path is None
         assert "Evidence:" in messages[-1]["content"]
         return Generation(
-            "The plan catalog was cached to reduce repeated database reads. This is recorded evidence.",
+            "The plan catalog was cached to reduce repeated database reads. This is recorded evidence. [DISCUSSION:msg-redis]",
             "fake-local",
             20,
             15,
@@ -103,7 +103,7 @@ def test_git_and_discussion_import_search_query_and_deduplication(tmp_path):
     assert answer["abstained"] is False
     assert answer["cloud_used"] is False
     assert answer["sources"]
-    assert "Sources:" in answer["answer"]
+    assert "[DISCUSSION:msg-redis]" in answer["answer"]
     assert engine.calls == 1
 
     with app_database(client).connect() as connection:
@@ -130,3 +130,61 @@ def test_git_import_rejects_non_repository(tmp_path):
         "/v1/memory/import/git", json={"repository_path": str(tmp_path)}
     )
     assert response.status_code == 400
+
+
+def test_memory_redaction_retention_and_strict_citations(tmp_path):
+    from datetime import datetime, timedelta, timezone
+
+    client, engine = make_client(tmp_path)
+    discussion = tmp_path / "approved.jsonl"
+    discussion.write_text(json.dumps({
+        "message_id": "cache", "author": "SRE", "channel": "architecture",
+        "timestamp": "2025-03-01T00:00:00Z", "text": "Cache rollout. API_KEY=sample-local-key",
+        "permalink": "https://user:pass@example.com/cache",
+    }))
+    source_id = client.post("/v1/memory/import/discussions", json={"file_path": str(discussion)}).json()["source_ids"][0]
+    result = client.post("/v1/memory/search", json={"question": "Cache rollout"}).json()["data"][0]
+    assert "[REDACTED]" in result["content"] and "sample-local-key" not in result["content"]
+    assert result["reference"] is None
+    assert client.post("/v1/memory/query", json={"question": "API_KEY=example-secret"}).status_code == 422
+    assert engine.calls == 0
+    result = client.post("/v1/memory/query", json={"question": "Cache rollout"}).json()
+    assert result["reason"] == "invalid_or_missing_citations" and result["sources"] == []
+
+    with app_database(client).connect() as connection:
+        connection.execute("UPDATE memory_sources SET content='Cache rotation. token=legacy-fixture' WHERE id=?", (source_id,))
+    assert client.post("/v1/memory/redact").json() == {"redacted": 1}
+    result = client.post("/v1/memory/search", json={"question": "rotation"}).json()["data"][0]
+    assert result["id"] == source_id and "legacy-fixture" not in result["content"]
+    with app_database(client).connect() as connection:
+        old = (datetime.now(timezone.utc) - timedelta(days=100)).isoformat()
+        connection.execute("UPDATE memory_sources SET imported_at=? WHERE id=?", (old, source_id))
+    assert client.post("/v1/memory/retention/purge", json={"retention_days": 90}).json() == {"deleted": 1}
+    assert client.get(f"/v1/memory/sources/{source_id}").status_code == 404
+    assert not client.post("/v1/memory/search", json={"question": "rotation"}).json()["data"]
+    assert client.delete(f"/v1/memory/sources/{source_id}", headers={"Authorization": ""}).status_code == 401
+
+
+def test_answer_rejects_single_generic_match_without_hiding_search_results(tmp_path):
+    client, engine = make_client(tmp_path)
+    source = tmp_path / "discussion.jsonl"
+    source.write_text(json.dumps({"message_id": "earth", "channel": "decision", "author": "SRE",
+                                  "timestamp": "2025-01-01T13:00:00Z",
+                                  "text": "PostgreSQL is the database for the plan catalog."}))
+    assert client.post("/v1/memory/import/discussions", json={"file_path": str(source)}).status_code == 200
+    question = {"question": "Which lunar telemetry database was selected?"}
+    assert client.post("/v1/memory/search", json=question).json()["data"]
+    assert client.post("/v1/memory/query", json=question).json()["abstained"]
+    assert engine.calls == 0
+
+
+def test_answer_retrieval_matches_inflected_terms_for_repository_history(tmp_path):
+    client, _ = make_client(tmp_path)
+    memory = client.app.state.memory
+    export = tmp_path / "history.jsonl"
+    export.write_text(json.dumps({"message_id": "session", "channel": "history", "author": "SRE",
+                                  "timestamp": "2025-01-06T13:00:00Z",
+                                  "text": "Rename session_cookie_ttl to session_ttl in the session loader. The lifetime remains 900 seconds."}))
+    memory.import_discussions(str(export))
+    rows = memory.retrieve_for_answer("Which session setting was renamed, and did its duration change?")
+    assert [row["metadata"]["citation"] for row in rows] == ["[DISCUSSION:session]"]

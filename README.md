@@ -68,9 +68,8 @@ source-backed knowledge layer:
 
 This helps developers investigate regressions, revisit tradeoffs, and onboard
 into unfamiliar code with a traceable path back to the original evidence.
-Memory data remains isolated from feedback and LoRA training queues. The
-backend capability is implemented, but **Developer Memory does not yet have a
-dedicated Next.js page**.
+Memory data remains isolated from feedback and LoRA training queues. Open Developer Memory in the command center to import approved sources,
+search evidence, ask the local model, and manage retention.
 
 ### What ITALIX.ai controls
 
@@ -118,8 +117,8 @@ qualification, and unsupported memory questions should produce an abstention.
   approved discussion exports, isolated from LoRA training data.
 - **Codex MCP integration** for status, inference, feedback, learning progress,
   controlled training plans, and controlled deployment plans.
-- **Next.js command center** with Overview, AI Gateway, and read-only
-  Learning Studio pages.
+- **Next.js command center** with Overview, AI Gateway, Learning Studio, and
+  Developer Memory.
 
 ## Product command center
 
@@ -205,7 +204,7 @@ excluded from Git.
 
 - Apple Silicon Mac with a supported macOS release
 - Python 3.11
-- Node.js 20 or newer and npm
+- Node.js 20.9 or newer and npm
 - Git
 - For optional local generation, allow disk space for the model snapshot and
   memory for inference alongside macOS and other applications
@@ -457,8 +456,12 @@ The larger models summarized the two-file smoke case more accurately.
 All three guessed classifications on cases that required abstention.
 The 100-case pilot is synthetic and still needs independent human review.
 Long-context performance, workload-wide model ranking, and cost savings are
-unverified. Developer Memory currently has a backend API and Learning Studio
-is read-only.
+unverified. The [Phase 10 review packet](docs/PHASE10_READINESS.md) documents
+the revised benchmark, workload probes, and release gates. The
+[Phase 11 validation](docs/PHASE11_VALIDATION.md) records the clean install,
+training preflight, Memory comparison, and public-patch pilot. The
+[Phase 12 runbook](docs/PHASE12_OPERATIONS.md) covers manual execution,
+interruption, and validation of the reviewed training job.
 
 
 ## Developer Memory
@@ -491,17 +494,18 @@ supported formats and safety boundary.
   content is screened on capture, feedback, and hybrid triage. Pattern-based
   screening can miss sensitive content. Sanitize patches before sending.
 - Training feedback requires an eligible captured trace.
-- Read-only Learning Studio responses expose aggregate metrics, never raw
+- Learning Studio status responses expose aggregate metrics, never raw
   examples, prompts, responses, adapter paths, or log paths.
 - Local services bind to `127.0.0.1` by default.
 - Secrets, SQLite state, traces, weights, checkpoints, logs, and sealed datasets
   are excluded from version control.
 
 The Phase 9 production npm audit reported zero findings. The full npm audit
-still reported development-tooling advisories. A publication audit of the pinned
-Python requirements reported advisories in `python-dotenv`, `mcp`, `streamlit`,
-and the development test runner `pytest`. The quickstart is for local loopback
-use. Review and update affected dependencies before exposing the services.
+still reported development-tooling advisories. The publication audit reported
+Python advisories in `python-dotenv`, `mcp`, `streamlit`, and the test runner
+`pytest`. Phase 10 upgraded all four pins and resolved additional
+installed-environment findings in Starlette and Pillow. The final Python environment audit reported
+zero known findings at verification time. The quickstart is for local loopback use.
 
 ## Verification
 
