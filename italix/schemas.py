@@ -51,6 +51,12 @@ class TrainingJobRequest(BaseModel):
     execute: bool = False
 
 
+class ExecuteTrainingPlanRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    review_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
 class ActivationRequest(BaseModel):
     workload: str = "pr_summary"
 
@@ -74,6 +80,12 @@ class DiscussionMemoryImportRequest(BaseModel):
 class MemoryQueryRequest(BaseModel):
     question: str = Field(min_length=3, max_length=2000)
     limit: int = Field(default=5, ge=1, le=10)
+
+
+class MemoryRetentionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    retention_days: int = Field(ge=1, le=3650, strict=True)
 
 
 class HybridTriageRequest(BaseModel):

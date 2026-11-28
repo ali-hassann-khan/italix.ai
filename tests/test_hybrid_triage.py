@@ -89,3 +89,39 @@ def test_configured_missing_weights_preserve_policy_decision(tmp_path, monkeypat
     assert result["explanation"]["evidence"]
     assert result["latency_ms"] >= 0
     assert default.calls == 0
+
+
+def test_explanations_repair_coverage_and_disclose_output_budget():
+    noisy = patch("billing/ledger/first.py") + "\n@@ -5,14 +5,14 @@\n" + "\n".join(
+        f"-# old {i}\n+# new {i}" for i in range(14)
+    )
+    source = "\n".join([noisy, *(patch(f"billing/ledger/{i}.py") for i in range(3))])
+    engine = EvidenceEngine('{"evidence_ids":[1,2]}')
+    output = hybrid_triage(source, explain=True, engine=engine)
+    assert output["decision_source"] == "deterministic_policy"
+    explanation = output["explanation"]
+    assert explanation["status"] == "coverage_repaired"
+    assert explanation["file_coverage"] == {
+        "covered_paths": ["billing/ledger/first.py", "billing/ledger/0.py", "billing/ledger/1.py"],
+        "total_files": 4, "complete": False,
+    }
+
+
+def test_phase12_evidence_fixture_and_coverage_baseline():
+    from hashlib import sha256
+    from pathlib import Path
+
+    from italix.evidence_ranking import ranked_patch_lines
+    from italix.hybrid_triage import patch_evidence
+
+    directory = Path(__file__).resolve().parents[1] / "data/phase12"
+    raw = (directory / "evidence-ranking.json").read_bytes()
+    assert sha256(raw).hexdigest() == (directory / "SHA256SUMS").read_text().split()[0]
+    fixture = json.loads(raw)
+    for case in fixture["examples"]:
+        paths, changes = patch_evidence(case["diff"])
+        assert paths == [entry["path"] for entry in case["required_evidence"]]
+        evidence = ranked_patch_lines(changes, fixture["selection_budget"])
+        assert [line["id"] for line in evidence[:len(case["required_evidence"])]] == [
+            entry["preferred_line_id"] for entry in case["required_evidence"][:fixture["selection_budget"]]
+        ]

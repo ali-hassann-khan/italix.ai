@@ -109,6 +109,16 @@ LOCAL_MODELS = {
 _MLX_WORKER = ThreadPoolExecutor(max_workers=1, thread_name_prefix="italix-mlx")
 
 
+def run_exclusive_mlx_task(function, *args):
+    """Evaluate on the inference thread without retaining an extra loaded model."""
+    def run():
+        if resident := LocalMLXEngine._resident:
+            resident._unload()
+        return function(*args)
+
+    return _MLX_WORKER.submit(run).result()
+
+
 class LocalMLXEngine:
     model_name = LOCAL_MODELS["qwen-base"].repository
     _resident: LocalMLXEngine | None = None

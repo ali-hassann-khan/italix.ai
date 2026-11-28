@@ -669,6 +669,28 @@ class Database:
             )
         return self.training_job(job_id)
 
+    def record_training_progress(self, job_id: int, step: int) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                """UPDATE training_jobs SET metrics_json=json_set(
+                    COALESCE(metrics_json, '{}'), '$.current_step',
+                    MAX(COALESCE(json_extract(metrics_json, '$.current_step'), 0), ?))
+                    WHERE id=? AND status='running'""", (step, job_id),
+            )
+
+    def recover_interrupted_training(self) -> int:
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """UPDATE training_queue SET status='pending' WHERE status='running'
+                   AND id IN (SELECT e.queue_id FROM training_job_examples e
+                   JOIN training_jobs j ON j.id=e.job_id WHERE j.status='running')"""
+            )
+            return connection.execute(
+                """UPDATE training_jobs SET status='failed', error='Local worker interrupted',
+                   completed_at=? WHERE status='running'""", (utc_now(),),
+            ).rowcount
+
     def fail_training_job(self, job_id: int, error: str) -> None:
         with self.connect() as connection:
             connection.execute(

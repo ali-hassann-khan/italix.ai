@@ -635,3 +635,184 @@ def test_provider_timeouts_are_sanitized():
 def test_server_evaluator_refuses_sealed_holdout_by_default():
     with pytest.raises(PermissionError, match="sealed holdout"):
         ServerEvaluator().compare("unused", split="holdout", workload="change_triage")
+
+
+def test_reviewed_training_failure_and_interruption_are_recoverable(tmp_path, monkeypatch):
+    from pathlib import Path
+
+    from italix.engines import LocalModelSpec
+
+    client, app, _, _ = make_client(tmp_path)
+    runner = app.state.training_runner
+    runner.root = tmp_path
+    source = Path(__file__).resolve().parents[1] / "data/v3"
+    dataset = tmp_path / "data/v3"
+    dataset.mkdir(parents=True)
+    for name in ("train.jsonl", "valid.jsonl"):
+        (dataset / name).write_bytes((source / name).read_bytes())
+    monkeypatch.setattr(LocalModelSpec, "cached_path", lambda _: tmp_path)
+    called = []
+
+    def fail_subprocess(command, job_id, lock):
+        assert lock.fileno() >= 0
+        called.append(command[1])
+        app.state.database.record_training_progress(job_id, 4)
+        with pytest.raises(PermissionError, match="worker"):
+            runner.recover_interrupted()
+        raise RuntimeError("simulated local subprocess failure")
+
+    monkeypatch.setattr(runner, "_run", fail_subprocess)
+    trace = client.post("/v1/chat/completions", json=request_body(capture=True)).json()
+    client.post(f"/v1/traces/{trace['italix']['trace_id']}/feedback", json={"action": "approve"})
+
+    def plan():
+        return client.post("/v1/training/jobs", json={"minimum_examples": 1}).json()["id"]
+
+    job_id = plan()
+    review = client.get(f"/v1/training/jobs/{job_id}/review").json()
+    assert review["dataset_checksums"] and review["queued_examples_sha256"]
+    execute = f"/v1/training/jobs/{job_id}/execute"
+    assert client.post(execute, json={"review_digest": "a" * 64}).status_code == 409
+    assert not called
+    response = client.post(execute, json={"review_digest": review["review_digest"]})
+    assert response.status_code == 202 and response.json()["status"] == "running"
+    assert len(called) == 1
+    job = client.get("/v1/training/jobs").json()["data"][0]
+    assert job["status"] == "failed" and job["metrics"]["current_step"] == 4
+    assert client.get("/v1/training/queue").json()["pending"] == 1
+    assert client.post(execute, json={"review_digest": review["review_digest"]}).status_code == 409
+
+    interrupted = plan()
+    app.state.database.start_training_job(interrupted, "interrupt-fixture")
+    assert client.post("/v1/training/recover").json() == {"recovered": 1}
+    assert client.get("/v1/training/queue").json()["pending"] == 1
+    assert app.state.database.training_job(interrupted)["status"] == "failed"
+
+
+def test_candidate_preview_uses_local_adapter_without_capture_or_activation(tmp_path):
+    client, app, local, _ = make_client(tmp_path)
+    adapter = tmp_path / "candidate"
+    adapter.mkdir()
+    (adapter / "adapters.safetensors").touch()
+    database = app.state.database
+    with database.connect() as connection:
+        connection.execute(
+            "UPDATE models SET path=?, status='experimental_failed', active=0 WHERE id='adapter-v2'",
+            (str(adapter),),
+        )
+    route_before = database.active_model("pr_summary")["id"]
+    url = "/v1/models/adapter-v2/preview"
+    assert client.post(url, json={"content": "token=private-preview"}).status_code == 422
+    result = client.post(url, json={"content": "synthetic diff"}).json()
+    assert result["output"] == local.text
+    assert local.adapter_paths == [str(adapter)]
+    assert database.active_model("pr_summary")["id"] == route_before
+    assert database.list_trace_metadata() == []
+    assert client.post("/v1/models/adapter-v2/activate", json={"workload": "pr_summary"}).status_code == 409
+
+
+def test_reviewed_training_registers_completed_candidate_and_keeps_failed_candidate_inactive(tmp_path, monkeypatch):
+    import shutil
+    import subprocess
+    from pathlib import Path
+
+    from italix.engines import LocalModelSpec
+
+    client, app, _, _ = make_client(tmp_path, evaluator=FakeEvaluator(qualified=False))
+    runner = app.state.training_runner
+    runner.root = tmp_path
+    shutil.copytree(Path(__file__).resolve().parents[1] / "data/v3", tmp_path / "data/v3")
+    monkeypatch.setattr(LocalModelSpec, "cached_path", lambda _: tmp_path)
+    operations = []
+
+    def simulate(command, job_id, lock):
+        operations.append(command)
+        assert lock.fileno() >= 0
+        if "--output" in command:
+            Path(command[command.index("--output") + 1]).write_bytes(b"fixture initial")
+        else:
+            adapter = tmp_path / command[command.index("--adapter-path") + 1]
+            (adapter / "adapters.safetensors").write_bytes(b"fixture updated")
+            runner.database.record_training_progress(job_id, 28)
+        return subprocess.CompletedProcess(command, 0, "Iter 28: Train loss 0.25\nIter 28: Val loss 0.35")
+
+    def delta(initial, trained):
+        assert initial.read_bytes() != trained.read_bytes()
+        return {"changed_tensors": 1}
+
+    monkeypatch.setattr(runner, "_run", simulate)
+    monkeypatch.setattr(runner, "_parameter_delta", delta)
+    trace = client.post("/v1/chat/completions", json=request_body(capture=True)).json()
+    assert client.post(f"/v1/traces/{trace['italix']['trace_id']}/feedback",
+                       json={"action": "approve"}).json()["queued"]
+    job_id = client.post("/v1/training/jobs", json={"minimum_examples": 1}).json()["id"]
+    review = client.get(f"/v1/training/jobs/{job_id}/review").json()
+    response = client.post(f"/v1/training/jobs/{job_id}/execute", json={"review_digest": review["review_digest"]})
+    assert response.status_code == 202
+    assert len(operations) == 2
+    job = client.get("/v1/training/jobs").json()["data"][0]
+    assert job["status"] == "completed"
+    assert job["metrics"]["changed_tensors"] == 1
+    assert client.get("/v1/training/queue").json()["counts"]["used"] == 1
+    candidate = job["candidate_id"]
+    model = app.state.database.model(candidate)
+    assert model["status"] == "experimental" and not model["active"]
+    evaluation = client.post(f"/v1/models/{candidate}/evaluation", json={"workload": "pr_summary"}).json()
+    assert evaluation["status"] == "experimental_failed"
+    assert client.post(f"/v1/models/{candidate}/activate", json={"workload": "pr_summary"}).status_code == 409
+    assert not app.state.database.model(candidate)["active"]
+
+
+def test_read_only_evaluation_reports_gate_without_changing_registry(tmp_path):
+    client, app, _, _ = make_client(tmp_path, evaluator=FakeEvaluator(qualified=True))
+    before = app.state.database.model("adapter-v2")
+    result = client.post("/v1/models/adapter-v2/evaluation?record=false", json={"workload": "pr_summary"})
+    assert result.status_code == 200 and result.json()["evaluation"]["qualified"]
+    assert result.json()["recorded"] is False
+    assert app.state.database.model("adapter-v2") == before
+
+
+def test_reviewed_interrupt_is_authenticated_and_targets_worker_group(tmp_path, monkeypatch):
+    import signal
+    from types import SimpleNamespace
+
+    from italix.training_jobs import ReviewedWorker
+
+    client, app, _, _ = make_client(tmp_path)
+    trace = client.post("/v1/chat/completions", json=request_body(capture=True)).json()
+    client.post(f"/v1/traces/{trace['italix']['trace_id']}/feedback", json={"action": "approve"})
+    db = app.state.database
+    job = db.create_training_job("pr_summary", 1)
+    db.start_training_job(job["id"], "synthetic-interrupt")
+    runner = app.state.training_runner
+    process = SimpleNamespace(pid=99999, poll=lambda: None)
+    worker = ReviewedWorker(process=process)
+    runner._reviewed_workers[job["id"]] = worker
+    calls = []
+    monkeypatch.setattr("italix.training_jobs.os.killpg", lambda *args: calls.append(args))
+    path = f"/v1/training/jobs/{job['id']}/interrupt"
+    assert client.post(path, headers={"Authorization": ""}).status_code == 401
+    assert client.post("/v1/training/jobs/888/interrupt").status_code == 409
+    assert not calls
+    assert client.post(path).status_code == 202
+    assert worker.interrupted and calls == [(process.pid, signal.SIGTERM)]
+    with pytest.raises(RuntimeError, match="interrupted"):
+        runner._check_interrupted(job["id"])
+
+
+def test_subprocess_logs_are_redacted_before_a_failure(tmp_path):
+    import sys
+
+    _, app, _, _ = make_client(tmp_path)
+    runner = app.state.training_runner
+    runner.root = tmp_path
+    job_dir = tmp_path / "artifacts/training_jobs/999"
+    job_dir.mkdir(parents=True)
+    simulate = [sys.executable, "-c",
+                "import os; assert not os.getenv('ITALIX_OPERATOR_TOKEN'); "
+                "print('Iter 4: Train loss 0.25 token=fixture-credential'); raise SystemExit(3)"]
+    with runner._lock() as lock:
+        with pytest.raises(RuntimeError, match="status 3"):
+            runner._run(simulate, 999, lock)
+    log = (job_dir / "training.log").read_text()
+    assert "[REDACTED]" in log and "fixture-credential" not in log

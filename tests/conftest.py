@@ -17,3 +17,6 @@ def pytest_configure(config):
     environment = pytest.MonkeyPatch()
     config.add_cleanup(environment.undo)
     environment.setenv("ITALIX_DB_PATH", str(Path(database_dir.name) / "import.sqlite"))
+    environment.setenv("GEMINI_API_KEY", "")
+    environment.setenv("GROQ_API_KEY", "")
+    environment.setenv("STREAMLIT_BROWSER_GATHER_USAGE_STATS", "false")

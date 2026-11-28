@@ -125,3 +125,32 @@ Low — name-only change."""
 
     assert result["invented_rename_claims"] == []
     assert result["invented_identifiers"] == []
+
+
+def test_evaluation_runs_on_the_inference_worker(monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import get_ident
+
+    from italix.engines import LocalMLXEngine, _MLX_WORKER
+
+    calls = []
+
+    class Resident:
+        def _unload(self):
+            calls.append(("unload", get_ident()))
+
+    monkeypatch.setattr(LocalMLXEngine, "_resident", Resident())
+    evaluator = evaluation.ServerEvaluator()
+
+    def compare(path, split):
+        calls.append(("compare", get_ident()))
+        return {"path": path, "split": split}
+
+    monkeypatch.setattr(evaluator, "_compare_pr", compare)
+    inference_thread = _MLX_WORKER.submit(get_ident).result()
+    with ThreadPoolExecutor(max_workers=1) as request_worker:
+        assert request_worker.submit(get_ident).result() != inference_thread
+        assert request_worker.submit(evaluator.compare, "candidate").result() == {
+            "path": "candidate", "split": "valid",
+        }
+    assert calls == [("unload", inference_thread), ("compare", inference_thread)]

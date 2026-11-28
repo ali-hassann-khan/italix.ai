@@ -7,9 +7,10 @@ from hashlib import sha256
 import json
 from pathlib import Path
 import re
+from time import perf_counter
 from typing import Any
 
-from italix.engines import cached_qwen_path
+from italix.engines import DeterministicPRSummaryEngine, cached_qwen_path, run_exclusive_mlx_task
 from italix.pr_summary import SYSTEM_PROMPT
 from italix.change_triage import COMPACT_PROMPT, MAX_GENERATION_TOKENS as TRIAGE_TOKENS, PRODUCTION_PROMPT
 
@@ -212,6 +213,7 @@ class ServerEvaluator:
             user = row["messages"][-2]
             messages = ([{"role": "system", "content": SYSTEM_PROMPT}] if scaffold else []) + [user]
             prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            started = perf_counter()
             response = generate(
                 model,
                 tokenizer,
@@ -221,9 +223,10 @@ class ServerEvaluator:
                 logits_processors=processors,
                 verbose=False,
             ).strip()
+            latency = (perf_counter() - started) * 1000
             target = row["messages"][-1]["content"]
             result = score_response(response, target, user["content"])
-            result.update({"index": index, "response": response})
+            result.update({"index": index, "response": response, "generation_latency_ms": latency})
             results.append(result)
         del model, tokenizer
         mx.clear_cache()
@@ -235,6 +238,21 @@ class ServerEvaluator:
             "total": len(results),
             "examples": results,
         }
+
+    @staticmethod
+    def _deterministic_pr(rows):
+        engine = DeterministicPRSummaryEngine()
+        results = []
+        for index, row in enumerate(rows, 1):
+            user, target = row["messages"][-2:]
+            started = perf_counter()
+            output = engine.generate([user], MAX_TOKENS, 0.0)
+            latency = (perf_counter() - started) * 1000
+            scores = score_response(output.text, target["content"], user["content"])
+            results.append({**scores, "index": index, "response": output.text,
+                            "generation_latency_ms": latency, "deterministic_validation": output.metadata["validation"]})
+        return {"name": engine.model_name, "total": len(results),
+                "passed": sum(row["passed"] for row in results), "examples": results}
 
     def _compare_pr(self, candidate_path: str, split: str) -> dict[str, Any]:
         if split not in {"valid", "holdout"}:
@@ -275,6 +293,7 @@ class ServerEvaluator:
                 "testing_line": "- Not run (not shown in diff).",
             },
             "candidates": candidates,
+            "diagnostic_baseline": self._deterministic_pr(rows),
             "qualified": qualified,
             "qualification_reason": (
                 "candidate passed every example and exceeded scaffold baseline"
@@ -344,7 +363,7 @@ class ServerEvaluator:
         if split == "holdout" and not self.allow_holdout:
             raise PermissionError("sealed holdout evaluation requires an explicitly authorized evaluator")
         if workload == "change_triage":
-            return self._compare_triage(candidate_path, split)
+            return run_exclusive_mlx_task(self._compare_triage, candidate_path, split)
         if workload == "pr_summary":
-            return self._compare_pr(candidate_path, split)
+            return run_exclusive_mlx_task(self._compare_pr, candidate_path, split)
         raise ValueError(f"unsupported evaluation workload: {workload}")

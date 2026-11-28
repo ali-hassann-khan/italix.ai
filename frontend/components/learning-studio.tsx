@@ -5,7 +5,6 @@ import {
   AlertCircle,
   ArrowRight,
   BadgeCheck,
-  Ban,
   BookOpenCheck,
   Boxes,
   BrainCircuit,
@@ -25,6 +24,7 @@ import {
   TimerReset,
 } from "lucide-react";
 
+import { LearningActions } from "@/components/learning-actions";
 import { OperatorUnlock } from "@/components/gateway-playground";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -177,8 +177,8 @@ export function LearningStudio() {
   const [data, setData] = useState<LearningStudioData | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  const load = useCallback(async () => {
-    setState("loading");
+  const load = useCallback(async (quiet = false) => {
+    if (!quiet) setState("loading");
     setError(null);
     try {
       const response = await fetch("/api/operator/learning", { cache: "no-store" });
@@ -198,9 +198,15 @@ export function LearningStudio() {
       .catch(() => setState("locked"));
   }, [load]);
 
+  useEffect(() => {
+    if (!data?.jobs.some((job) => job.status === "running")) return;
+    const interval = window.setInterval(() => void load(true), 2500);
+    return () => window.clearInterval(interval);
+  }, [data?.jobs, load]);
+
   if (state === "checking" || state === "loading") return <LoadingStudio />;
   if (state === "locked") return <OperatorUnlock onUnlocked={() => void load()} />;
   if (state === "error" || !data) return <Card className="border-rose-400/[0.12] bg-[#0d0d11]/84"><CardContent className="grid min-h-64 place-items-center p-6 text-center"><div><AlertCircle className="mx-auto size-6 text-rose-300" /><h3 className="mt-4 text-sm font-medium text-zinc-200">Learning status unavailable</h3><p className="mt-2 max-w-md text-xs leading-5 text-zinc-600">{error}</p><button type="button" onClick={() => void load()} className="mx-auto mt-4 flex h-9 items-center gap-2 rounded-lg border border-white/[0.08] px-3 text-xs text-zinc-400 hover:bg-white/[0.04]"><RefreshCw className="size-3.5" /> Retry</button></div></CardContent></Card>;
 
-  return <div className="space-y-4"><div className="flex items-center justify-between rounded-lg border border-white/[0.055] bg-white/[0.015] px-4 py-3"><p className="flex items-center gap-2 text-[10px] uppercase tracking-[0.12em] text-zinc-600"><Ban className="size-3 text-violet-400" /> Read-only studio · no training or deployment actions</p><p className="hidden items-center gap-2 font-mono text-[10px] text-zinc-700 sm:flex"><MemoryStick className="size-3" /> Aggregates only · examples excluded</p></div><SummaryCards data={data} /><Readiness data={data} /><Workflow data={data} /><TrainingJobs jobs={data.jobs} /><Registry data={data} /><Configurations data={data} /></div>;
+  return <div className="space-y-4"><div className="flex items-center justify-between rounded-lg border border-white/[0.055] bg-white/[0.015] px-4 py-3"><p className="flex items-center gap-2 text-[10px] uppercase tracking-[0.12em] text-zinc-600"><ShieldAlert className="size-3 text-violet-400" /> Training and route changes require confirmation</p><p className="hidden items-center gap-2 font-mono text-[10px] text-zinc-700 sm:flex"><MemoryStick className="size-3" /> Aggregates only · examples excluded</p></div><SummaryCards data={data} /><Readiness data={data} /><Workflow data={data} /><TrainingJobs jobs={data.jobs} /><Registry data={data} /><Configurations data={data} /><LearningActions data={data} onChange={() => void load(true)} /></div>;
 }

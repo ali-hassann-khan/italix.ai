@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import json
+import logging
+import traceback
 import os
 from time import perf_counter
 from pathlib import Path
 
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException, Response
+from fastapi import BackgroundTasks, Body, Depends, FastAPI, HTTPException, Query, Response
 
 from italix.auth import BearerAuthorizer
 from italix.database import TRAINING_WORKLOADS, Database
@@ -17,12 +19,13 @@ from italix.engines import (
     GeminiEngine,
     GroqEngine,
     LocalMLXEngine,
+    prepare_messages,
 )
 from italix.evaluation import ServerEvaluator
 from italix.hybrid_triage import hybrid_triage
 from italix.memory import MemoryService
-from italix.privacy import redact
-from italix.change_triage import PRODUCTION_PROMPT, deterministic_triage
+from italix.privacy import contains_secret, redact
+from italix.change_triage import PRODUCTION_PROMPT, deterministic_triage, validate_triage_output
 from italix.schemas import (
     ActivationRequest,
     DashboardOverviewResponse,
@@ -31,10 +34,12 @@ from italix.schemas import (
     GitMemoryImportRequest,
     DiscussionMemoryImportRequest,
     MemoryQueryRequest,
+    MemoryRetentionRequest,
     HybridTriageRequest,
     HybridTriageV2Request,
     ModelEvaluationRequest,
     TrainingJobRequest,
+    ExecuteTrainingPlanRequest,
 )
 from italix.service import GatewayService
 from italix.training_jobs import TrainingJobRunner
@@ -167,6 +172,45 @@ def create_app(
     def training_jobs(limit: int = 50):
         return {"data": database.list_training_jobs(max(1, min(limit, 200)))}
 
+    @app.get("/v1/training/jobs/{job_id}/review", dependencies=[Depends(authorizer.require_operator)])
+    def review_training(job_id: int):
+        try:
+            return runner.review(job_id)
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except PermissionError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/v1/training/jobs/{job_id}/execute", status_code=202,
+              dependencies=[Depends(authorizer.require_operator)])
+    def execute_training(job_id: int, request: ExecuteTrainingPlanRequest, tasks: BackgroundTasks):
+        try:
+            prepared = runner.prepare_reviewed(job_id, request.review_digest)
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except (PermissionError, ValueError) as exc:
+            raise HTTPException(status_code=409, detail=redact(str(exc))) from exc
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=503, detail=redact(str(exc))) from exc
+        tasks.add_task(runner.run_reviewed, job_id, prepared)
+        return {"id": job_id, "status": "running", "candidate_id": prepared[1]}
+
+    @app.post("/v1/training/jobs/{job_id}/interrupt", status_code=202,
+              dependencies=[Depends(authorizer.require_operator)])
+    def interrupt_training(job_id: int):
+        try:
+            runner.interrupt_reviewed(job_id)
+        except PermissionError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {"id": job_id, "status": "interruption_requested"}
+
+    @app.post("/v1/training/recover", dependencies=[Depends(authorizer.require_operator)])
+    def recover_training():
+        try:
+            return {"recovered": runner.recover_interrupted()}
+        except PermissionError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
     @app.get("/v1/training/config", dependencies=[Depends(authorizer.require_operator)])
     def training_config(workload: str = "pr_summary"):
         try:
@@ -190,11 +234,37 @@ def create_app(
         except PermissionError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
+    @app.post("/v1/models/{model_id}/preview", dependencies=[Depends(authorizer.require_operator)])
+    def preview_candidate(model_id: str, content: str = Body(embed=True, min_length=1, max_length=20000)):
+        model = database.model(model_id)
+        if model is None or model["kind"] != "adapter":
+            raise HTTPException(status_code=404, detail="adapter candidate not found")
+        if contains_secret(content):
+            raise HTTPException(status_code=422, detail="patch resembles a credential")
+        if not model["path"]:
+            raise HTTPException(status_code=503, detail="adapter artifacts are unavailable")
+        adapter = Path(model["path"]).resolve()
+        if not adapter.is_dir() or not (adapter / "adapters.safetensors").is_file():
+            raise HTTPException(status_code=503, detail="adapter artifacts are unavailable")
+        workload = model["workload"]
+        try:
+            generated = service.local.generate(
+                prepare_messages(workload, [{"role": "user", "content": content}]),
+                max_tokens=60 if workload == "change_triage" else 320,
+                temperature=0.0, adapter_path=str(adapter),
+            )
+        except (OSError, RuntimeError, ValueError, ImportError) as exc:
+            raise HTTPException(status_code=503, detail="adapter preview could not run locally") from exc
+        output = redact(generated.text)
+        return {"model_id": model_id, "workload": workload, "output": output,
+                "prompt_tokens": generated.prompt_tokens, "completion_tokens": generated.completion_tokens,
+                "validation": validate_triage_output(output, content) if workload == "change_triage" else None}
+
     @app.post(
         "/v1/models/{model_id}/evaluation",
         dependencies=[Depends(authorizer.require_operator)],
     )
-    def record_evaluation(model_id: str, request: ModelEvaluationRequest):
+    def record_evaluation(model_id: str, request: ModelEvaluationRequest, record: bool = True):
         model = database.model(model_id)
         if model is None:
             raise HTTPException(status_code=404, detail="model not found")
@@ -209,7 +279,10 @@ def create_app(
         except PermissionError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except (OSError, RuntimeError, ValueError) as exc:
+            logging.getLogger(__name__).warning("Local adapter evaluation failed:\n%s", redact(traceback.format_exc()))
             raise HTTPException(status_code=503, detail="adapter evaluation could not run locally") from exc
+        if not record:
+            return {"id": model_id, "recorded": False, "evaluation": result}
         return database.apply_model_evaluation(model_id, result)
 
     @app.post(
@@ -260,17 +333,25 @@ def create_app(
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.get("/v1/memory/search", dependencies=[Depends(authorizer.require_operator)])
-    def search_memory(q: str, limit: int = 5):
+    def search_memory(q: str = Query(max_length=2000), limit: int = 5):
+        if contains_secret(q):
+            raise HTTPException(status_code=422, detail="query resembles a credential")
         if not q.strip():
             raise HTTPException(status_code=422, detail="q is required")
         return {"query": q, "data": memory.search(q, max(1, min(limit, 10)))}
+
+    @app.post("/v1/memory/search", dependencies=[Depends(authorizer.require_operator)])
+    def search_memory_private(request: MemoryQueryRequest):
+        return search_memory(request.question, request.limit)
 
     @app.post("/v1/memory/query", dependencies=[Depends(authorizer.require_operator)])
     def query_memory(request: MemoryQueryRequest):
         try:
             return memory.query(request.question, request.limit)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=redact(str(exc))) from exc
         except (FileNotFoundError, RuntimeError) as exc:
-            raise HTTPException(status_code=503, detail=str(exc)) from exc
+            raise HTTPException(status_code=503, detail=redact(str(exc))) from exc
 
     @app.get(
         "/v1/memory/sources/{source_id}",
@@ -281,6 +362,20 @@ def create_app(
         if source is None:
             raise HTTPException(status_code=404, detail="memory source not found")
         return source
+
+    @app.delete("/v1/memory/sources/{source_id}", dependencies=[Depends(authorizer.require_operator)])
+    def delete_memory_source(source_id: str):
+        if not memory.delete_source(source_id):
+            raise HTTPException(status_code=404, detail="memory source not found")
+        return {"deleted": 1}
+
+    @app.post("/v1/memory/redact", dependencies=[Depends(authorizer.require_operator)])
+    def redact_memory():
+        return {"redacted": memory.redact_existing()}
+
+    @app.post("/v1/memory/retention/purge", dependencies=[Depends(authorizer.require_operator)])
+    def purge_memory(request: MemoryRetentionRequest):
+        return {"deleted": memory.purge(request.retention_days)}
 
     @app.post(
         "/v1/hybrid/change-triage",
